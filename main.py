@@ -1344,9 +1344,11 @@ def instagram_post():
         safe_title = sanitize(info.get("title") or info.get("description") or "post")
         print(f"[IG post] type={post_type}  title={safe_title!r}")
 
+        # ── VIDEO ──────────────────────────────────────────────────────────
         if post_type == "video":
             return _ig_download_video_response(url, safe_title, tmp)
 
+        # ── SINGLE IMAGE ───────────────────────────────────────────────────
         if post_type == "image":
             img_url = _ig_best_image_url(info)
             if not img_url:
@@ -1362,6 +1364,7 @@ def instagram_post():
                 download_name=f"{safe_title}.{ext}",
             )
 
+        # ── CAROUSEL ───────────────────────────────────────────────────────
         if post_type == "carousel":
             entries = info.get("entries") or []
             if not entries:
@@ -1373,59 +1376,86 @@ def instagram_post():
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for i, entry in enumerate(entries, start=1):
                     entry_fmts = entry.get("formats") or []
+
+                    # Check if this slide is actually a video
                     has_vid = any(
                         (f.get("vcodec") or "none") != "none"
                         for f in entry_fmts
                         if f.get("url")
                     )
-                    if has_vid:
-                        slide_tmp = tempfile.mkdtemp(prefix=f"vf_ig_slide{i}_")
-                        try:
-                            slide_url = entry.get("webpage_url") or entry.get("url", "")
-                            if not slide_url:
-                                errors.append(f"slide_{i:02d}: no URL")
-                                continue
-                            opts = _ig_opts(
-                                {
-                                    "format": "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-                                    "outtmpl": os.path.join(
-                                        slide_tmp, "%(title)s.%(ext)s"
-                                    ),
-                                    "merge_output_format": "mp4",
-                                    "postprocessors": [
-                                        {
-                                            "key": "FFmpegVideoConvertor",
-                                            "preferedformat": "mp4",
-                                        }
-                                    ],
-                                }
-                            )
-                            with yt_dlp.YoutubeDL(opts) as ydl:
-                                ydl.extract_info(slide_url, download=True)
-                            mp4 = find_file(slide_tmp, "mp4")
-                            if mp4:
-                                with open(mp4, "rb") as fh:
-                                    zf.writestr(f"slide_{i:02d}.mp4", fh.read())
-                                print(f"[IG carousel] slide {i} video ✅")
-                            else:
-                                errors.append(f"slide_{i:02d}: mp4 not found")
-                        except Exception as e:
-                            errors.append(f"slide_{i:02d} video error: {str(e)[:100]}")
-                        finally:
-                            cleanup(slide_tmp)
-                    else:
+
+                    if not has_vid:
+                        # ── IMAGE SLIDE — download thumbnail directly ──
                         img_url = _ig_best_image_url(entry)
-                        if not img_url:
+                        if img_url:
+                            try:
+                                img_bytes, ext = _ig_download_image(img_url)
+                                zf.writestr(f"slide_{i:02d}.{ext}", img_bytes)
+                                print(f"[IG carousel] slide {i} image ✅")
+                            except Exception as e:
+                                errors.append(
+                                    f"slide_{i:02d} image error: {str(e)[:100]}"
+                                )
+                        else:
                             errors.append(f"slide_{i:02d}: no image URL")
+                        continue
+
+                    # ── VIDEO SLIDE ────────────────────────────────────────
+                    slide_tmp = tempfile.mkdtemp(prefix=f"vf_ig_slide{i}_")
+                    try:
+                        slide_url = entry.get("webpage_url") or entry.get("url", "")
+                        if not slide_url:
+                            errors.append(f"slide_{i:02d}: no URL")
                             continue
-                        try:
-                            img_bytes, ext = _ig_download_image(img_url)
-                            zf.writestr(f"slide_{i:02d}.{ext}", img_bytes)
-                            print(
-                                f"[IG carousel] slide {i} image ✅ ({len(img_bytes):,} bytes)"
-                            )
-                        except Exception as e:
-                            errors.append(f"slide_{i:02d} image error: {str(e)[:100]}")
+
+                        opts = _ig_opts(
+                            {
+                                "format": "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+                                "outtmpl": os.path.join(slide_tmp, "%(title)s.%(ext)s"),
+                                "merge_output_format": "mp4",
+                                "postprocessors": [
+                                    {
+                                        "key": "FFmpegVideoConvertor",
+                                        "preferedformat": "mp4",
+                                    }
+                                ],
+                            }
+                        )
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            ydl.extract_info(slide_url, download=True)
+
+                        mp4 = find_file(slide_tmp, "mp4")
+                        if mp4:
+                            with open(mp4, "rb") as fh:
+                                zf.writestr(f"slide_{i:02d}.mp4", fh.read())
+                            print(f"[IG carousel] slide {i} video ✅")
+                        else:
+                            errors.append(f"slide_{i:02d}: mp4 not found")
+
+                    except yt_dlp.utils.DownloadError as e:
+                        # "No video formats" = yt-dlp wrongly flagged an image slide as video
+                        # Fall back to image download
+                        if "no video formats" in str(e).lower():
+                            img_url = _ig_best_image_url(entry)
+                            if img_url:
+                                try:
+                                    img_bytes, ext = _ig_download_image(img_url)
+                                    zf.writestr(f"slide_{i:02d}.{ext}", img_bytes)
+                                    print(f"[IG carousel] slide {i} fallback image ✅")
+                                except Exception as fe:
+                                    errors.append(
+                                        f"slide_{i:02d} fallback error: {str(fe)[:80]}"
+                                    )
+                            else:
+                                errors.append(
+                                    f"slide_{i:02d}: no video formats and no image fallback"
+                                )
+                        else:
+                            errors.append(f"slide_{i:02d} video error: {str(e)[:100]}")
+                    except Exception as e:
+                        errors.append(f"slide_{i:02d} unexpected: {str(e)[:100]}")
+                    finally:
+                        cleanup(slide_tmp)
 
             if errors:
                 print(f"[IG carousel] ⚠️ errors: {errors}")
