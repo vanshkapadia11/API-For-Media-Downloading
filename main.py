@@ -706,26 +706,54 @@ def _ig_classify(info: dict) -> str:
 
 
 def _ig_extract_with_rotation(url: str, download: bool = False, extra: dict = {}):
-    max_attempts = (
-        max(1, len(_proxy_manager._proxies)) if _proxy_manager.has_proxies() else 1
-    )
     last_exc = None
-    for attempt in range(max_attempts):
+    cp = _get_cookie_path("instagram")
+
+    # Each attempt uses different options to work around Instagram's blocks
+    strategies = [
+        # Strategy 1: default
+        {"noplaylist": True},
+        # Strategy 2: allow playlist (fixes "No video formats found" on /p/ posts)
+        {"noplaylist": False},
+        # Strategy 3: different UA
+        {
+            "noplaylist": False,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+            },
+        },
+        # Strategy 4: no extractor args at all
+        {"noplaylist": False, "extractor_args": {}},
+    ]
+
+    for i, strategy_opts in enumerate(strategies):
         current_proxy = _proxy_manager.current()
         try:
-            opts = _ig_opts(extra=extra, proxy=current_proxy)
+            print(f"[IG] Trying strategy {i+1}/4")
+            opts = _base_opts(download=download, proxy=current_proxy)
+            opts["http_headers"] = {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+            }
+            opts.update(strategy_opts)
+            opts.update(extra)
+            if cp:
+                opts["cookiefile"] = cp
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=download)
-            return info
+            if info:
+                print(f"[IG] ✅ strategy {i+1} worked")
+                return info
         except Exception as e:
             msg = str(e)
             last_exc = e
+            print(f"[IG] ❌ strategy {i+1}: {msg[:120]}")
             if _is_proxy_error(msg):
-                print(f"[IG] 🔄 Proxy error on attempt {attempt + 1}, rotating…")
                 _proxy_manager.rotate()
-                continue
-            raise
-    raise last_exc
+            if "login" in msg.lower() or "private" in msg.lower():
+                raise
+            continue
+
+    raise last_exc or Exception("All Instagram strategies failed")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
