@@ -113,7 +113,13 @@ class ProxyManager:
         with self._lock:
             if not self._proxies:
                 return ""
-            return self._proxies[self._index % len(self._proxies)]
+            for _ in range(len(self._proxies)):
+                p = self._proxies[self._index % len(self._proxies)]
+                with _proxy_failures_lock:
+                    if _proxy_failures.get(p, 0) < _PROXY_DEAD_THRESHOLD:
+                        return p
+                self._index = (self._index + 1) % len(self._proxies)
+            return self._proxies[0]  # all dead, return first as fallback
 
     def rotate(self) -> str:
         with self._lock:
@@ -127,8 +133,29 @@ class ProxyManager:
     def has_proxies(self) -> bool:
         return len(self._proxies) > 0
 
+    def record_failure(self, proxy: str):
+        if not proxy:
+            return
+        with _proxy_failures_lock:
+            _proxy_failures[proxy] = _proxy_failures.get(proxy, 0) + 1
+            count = _proxy_failures[proxy]
+            if count >= _PROXY_DEAD_THRESHOLD:
+                print(f"[proxy] 💀 {proxy[:50]} marked dead ({count} failures)")
 
+    def record_success(self, proxy: str):
+        if not proxy:
+            return
+        with _proxy_failures_lock:
+            if _proxy_failures.get(proxy, 0) > 0:
+                print(f"[proxy] ✅ {proxy[:50]} recovered")
+            _proxy_failures[proxy] = 0
+
+
+# _proxy_manager = ProxyManager()
 _proxy_manager = ProxyManager()
+_proxy_failures: dict[str, int] = {}
+_proxy_failures_lock = threading.Lock()
+_PROXY_DEAD_THRESHOLD = 5
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -502,6 +529,9 @@ def _base_opts(download: bool = False, proxy: str = "") -> dict:
 # (client, skip_protos, use_cookies, ua)
 # ══════════════════════════════════════════════════════════════════════════════
 
+_last_success: dict = {"proxy_index": 0, "client": "android"}
+_last_success_lock = threading.Lock()
+
 _YT_CLIENT_CHAIN: list[tuple[str, list, bool, str]] = [
     ("ios", [], False, _UA_IOS),
     ("android", [], False, _UA_ANDROID),
@@ -558,16 +588,26 @@ def _yt_opts_for_client(
 def _extract_yt(url: str, extra: dict = {}, download: bool = False):
     """
     Try each client in _YT_CLIENT_CHAIN.
+    - Starts from last known working proxy+client combo.
     - On bot-check errors: record the failure, try the next client.
     - On proxy errors: rotate the proxy and retry all clients.
     - On hard errors (private, copyright): re-raise immediately.
     - Resets the bot-check counter on any success.
     """
+
     max_proxy_retries = (
         max(1, len(_proxy_manager._proxies)) if _proxy_manager.has_proxies() else 1
     )
     last_exc = None
-    cookie_path = _get_cookie_path("youtube")  # may be None if no cookies
+    cookie_path = _get_cookie_path("youtube")
+
+    # Start from last known good proxy
+    with _last_success_lock:
+        _proxy_manager._index = _last_success["proxy_index"]
+        preferred_client = _last_success["client"]
+
+    # Reorder chain to try preferred client first
+    chain = sorted(_YT_CLIENT_CHAIN, key=lambda c: 0 if c[0] == preferred_client else 1)
 
     for proxy_attempt in range(max_proxy_retries):
         current_proxy = _proxy_manager.current()
@@ -577,7 +617,8 @@ def _extract_yt(url: str, extra: dict = {}, download: bool = False):
                 f"→ {current_proxy[:50] or 'direct'}"
             )
 
-        for client, skip_protos, use_cookies, ua in _YT_CLIENT_CHAIN:
+        # for client, skip_protos, use_cookies, ua in _YT_CLIENT_CHAIN:
+        for client, skip_protos, use_cookies, ua in chain:
             try:
                 print(f"[yt-dlp] Trying client={client}")
                 opts = _yt_opts_for_client(
@@ -605,6 +646,10 @@ def _extract_yt(url: str, extra: dict = {}, download: bool = False):
                 if download or has_real or info.get("url"):
                     print(f"[yt-dlp] ✅ client={client}")
                     _reset_bot_check_counter(cookie_path)
+                    _proxy_manager.record_success(current_proxy)
+                    with _last_success_lock:
+                        _last_success["proxy_index"] = _proxy_manager._index
+                        _last_success["client"] = client
                     return info, client
 
                 print(f"[yt-dlp] ⚠️  client={client} — no real formats, skipping")
@@ -621,6 +666,7 @@ def _extract_yt(url: str, extra: dict = {}, download: bool = False):
 
                 if _is_bot_check(msg):
                     _record_bot_check(cookie_path)
+                    _proxy_manager.record_failure(current_proxy)
                     with _po_lock:
                         _po_token_cache.pop(current_proxy or "direct", None)
                     _proxy_manager.rotate()
@@ -857,6 +903,25 @@ HEIGHT_MAP = {
     "240p": 240,
     "144p": 144,
 }
+
+_info_cache: dict[str, tuple[dict, float]] = {}
+_INFO_CACHE_TTL = 300  # 5 minutes
+
+
+def _cached_extract_info(url: str):
+    now = time.time()
+    cached = _info_cache.get(url)
+    if cached and (now - cached[1]) < _INFO_CACHE_TTL:
+        print(f"[cache] ✅ hit for {url[:60]}")
+        return cached[0]
+    info, client = _extract_yt(url, download=False)
+    result = {"info": info, "client": client}
+    _info_cache[url] = (result, now)
+    if len(_info_cache) > 500:
+        oldest = sorted(_info_cache, key=lambda k: _info_cache[k][1])[:100]
+        for k in oldest:
+            _info_cache.pop(k, None)
+    return result
 
 
 def yt_err(msg: str):
@@ -1122,7 +1187,8 @@ def youtube_info():
     if not url:
         return jsonify({"error": "URL required"}), 400
     try:
-        info, client = _extract_yt(url, download=False)
+        cached = _cached_extract_info(url)
+        info, client = cached["info"], cached["client"]
         thumb = info.get("thumbnail") or ""
         if not thumb and info.get("thumbnails"):
             thumb = sorted(
@@ -1141,8 +1207,10 @@ def youtube_info():
             }
         )
     except yt_dlp.utils.DownloadError as e:
+        cleanup(tmp)
         return yt_err(str(e))
     except Exception as e:
+        cleanup(tmp)
         return jsonify({"error": str(e)[:300]}), 500
 
 
