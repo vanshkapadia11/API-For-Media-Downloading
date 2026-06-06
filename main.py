@@ -151,11 +151,10 @@ class ProxyManager:
             _proxy_failures[proxy] = 0
 
 
-# _proxy_manager = ProxyManager()
-_proxy_manager = ProxyManager()
 _proxy_failures: dict[str, int] = {}
 _proxy_failures_lock = threading.Lock()
 _PROXY_DEAD_THRESHOLD = 5
+_proxy_manager = ProxyManager()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
