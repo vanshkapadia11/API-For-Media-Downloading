@@ -471,7 +471,7 @@ def _base_opts(download: bool = False, proxy: str = "") -> dict:
     opts: dict = {
         "quiet": True,
         "no_warnings": False,
-        "noplaylist": True,
+        "noplaylist": False,
         "nocheckcertificate": True,
         "retries": 5 if download else 3,
         "fragment_retries": 5 if download else 2,
@@ -545,6 +545,7 @@ def _yt_opts_for_client(
         cp = _get_cookie_path("youtube")
         if cp:
             opts["cookiefile"] = cp
+            # dl_opts["cookiesfrombrowser"] = ("chrome",)
 
     return opts
 
@@ -700,9 +701,29 @@ def _ig_classify(info: dict) -> str:
     entries = info.get("entries") or []
     if entries:
         return "carousel"
+    if info.get("_type") == "playlist":
+        return "carousel"
+    # Also check if it's a multi-media post by looking at the URL pattern
+    if info.get("webpage_url", "").count("/p/") > 0 and not info.get("formats"):
+        return "carousel"
     fmts = info.get("formats") or []
+    # Check vcodec
     has_vid = any((f.get("vcodec") or "none") != "none" for f in fmts if f.get("url"))
-    return "video" if has_vid else "image"
+    if has_vid:
+        return "video"
+    # Fallback: if any format has a video extension, treat as video
+    video_exts = {"mp4", "mov", "webm", "mkv", "m4v"}
+    has_vid_ext = any(f.get("ext", "") in video_exts for f in fmts if f.get("url"))
+    if has_vid_ext:
+        return "video"
+    # Fallback: if top-level url looks like a video
+    top_url = info.get("url", "")
+    if any(ext in top_url for ext in [".mp4", ".mov", ".webm"]):
+        return "video"
+    # Fallback: check _type field
+    if info.get("_type") == "video":
+        return "video"
+    return "image"
 
 
 def _ig_extract_with_rotation(url: str, download: bool = False, extra: dict = {}):
@@ -711,21 +732,20 @@ def _ig_extract_with_rotation(url: str, download: bool = False, extra: dict = {}
 
     # Each attempt uses different options to work around Instagram's blocks
     strategies = [
-        # Strategy 1: default
-        {"noplaylist": True},
-        # Strategy 2: allow playlist (fixes "No video formats found" on /p/ posts)
+        # Strategy 1: allow playlist (Instagram posts are playlists)
         {"noplaylist": False},
-        # Strategy 3: different UA
+        # Strategy 2: different UA
         {
             "noplaylist": False,
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
             },
         },
-        # Strategy 4: no extractor args at all
+        # Strategy 3: no extractor args
         {"noplaylist": False, "extractor_args": {}},
+        # Strategy 4: default fallback
+        {"noplaylist": True},
     ]
-
     for i, strategy_opts in enumerate(strategies):
         current_proxy = _proxy_manager.current()
         try:
@@ -738,6 +758,7 @@ def _ig_extract_with_rotation(url: str, download: bool = False, extra: dict = {}
             opts.update(extra)
             if cp:
                 opts["cookiefile"] = cp
+                # opts["cookiesfrombrowser"] = ("chrome",)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=download)
             if info:
@@ -751,6 +772,20 @@ def _ig_extract_with_rotation(url: str, download: bool = False, extra: dict = {}
                 _proxy_manager.rotate()
             if "login" in msg.lower() or "private" in msg.lower():
                 raise
+            # For carousel posts, "no video formats" is expected on image slides
+            # Don't treat this as a fatal error — let instagram_post handle it
+            if "no video formats" in msg.lower():
+                # Image-only carousel — yt-dlp can't handle these.
+                # Return a minimal info dict; instagram_post will call
+                # _ig_scrape_carousel_images to get the actual image URLs.
+                print(f"[IG] image-only carousel detected — handing off to scraper")
+                return {
+                    "_type": "playlist",
+                    "entries": [],
+                    "title": "",
+                    "webpage_url": url,
+                    "uploader": "",
+                }
             continue
 
     raise last_exc or Exception("All Instagram strategies failed")
@@ -1352,6 +1387,159 @@ def instagram_info():
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 500
 
+def _ig_scrape_carousel_images(url: str) -> list[str]:
+    """
+    Fetch carousel image URLs via Instagram's internal GraphQL API.
+    Tries multiple API endpoints in order.
+    """
+    cp = _get_cookie_path("instagram")
+    cookies = {}
+    if cp and os.path.exists(cp):
+        with open(cp, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) == 7 and "instagram.com" in parts[0]:
+                    cookies[parts[5]] = parts[6]
+
+    # Extract shortcode from URL
+    shortcode = ""
+    for part in url.rstrip("/").split("/"):
+        if part and part not in ("www.instagram.com", "instagram.com", "p", "https:", ""):
+            shortcode = part
+    if not shortcode:
+        print("[IG scrape] ❌ Could not extract shortcode from URL")
+        return []
+
+    print(f"[IG scrape] shortcode={shortcode}")
+
+    session = req_lib.Session()
+    session.cookies.update(cookies)
+
+    base_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.instagram.com/",
+        "Origin": "https://www.instagram.com",
+        "X-IG-App-ID": "936619743392459",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    session.headers.update(base_headers)
+
+    # ── Method 1: /api/v1/media/{media_id}/info/ ──────────────────────────
+    # First convert shortcode → media_id
+    def shortcode_to_id(sc: str) -> str:
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        n = 0
+        for char in sc:
+            n = n * 64 + alphabet.index(char)
+        return str(n)
+
+    try:
+        media_id = shortcode_to_id(shortcode)
+        api_url = f"https://www.instagram.com/api/v1/media/{media_id}/info/"
+        r = session.get(api_url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            items = data.get("items") or []
+            if items:
+                media = items[0]
+                carousel = media.get("carousel_media") or []
+                if carousel:
+                    urls = []
+                    for slide in carousel:
+                        img_versions = slide.get("image_versions2", {}).get("candidates") or []
+                        if img_versions:
+                            # Pick highest resolution (first candidate is largest)
+                            urls.append(img_versions[0]["url"])
+                    if urls:
+                        print(f"[IG scrape] ✅ Method 1 (media/info API): {len(urls)} images")
+                        return urls
+                # Single image post
+                img_versions = media.get("image_versions2", {}).get("candidates") or []
+                if img_versions:
+                    print(f"[IG scrape] ✅ Method 1 (single image): 1 image")
+                    return [img_versions[0]["url"]]
+        else:
+            print(f"[IG scrape] Method 1 status={r.status_code}")
+    except Exception as e:
+        print(f"[IG scrape] Method 1 failed: {e}")
+
+    # ── Method 2: GraphQL query ───────────────────────────────────────────
+    try:
+        graphql_url = "https://www.instagram.com/graphql/query/"
+        # doc_id for PostPageContainer query
+        payload = {
+            "doc_id": "8845758582119845",
+            "variables": json.dumps({"shortcode": shortcode, "fetch_tagged_user_count": None, "hoisted_comment_id": None, "hoisted_reply_id": None}),
+        }
+        r = session.post(graphql_url, data=payload, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            media = (
+                data.get("data", {}).get("xdt_shortcode_media")
+                or data.get("data", {}).get("shortcode_media")
+                or {}
+            )
+            edges = media.get("edge_sidecar_to_children", {}).get("edges") or []
+            if edges:
+                urls = []
+                for edge in edges:
+                    node = edge.get("node", {})
+                    resources = node.get("display_resources") or []
+                    if resources:
+                        urls.append(resources[-1]["src"])
+                    elif node.get("display_url"):
+                        urls.append(node["display_url"])
+                if urls:
+                    print(f"[IG scrape] ✅ Method 2 (GraphQL): {len(urls)} images")
+                    return urls
+        else:
+            print(f"[IG scrape] Method 2 status={r.status_code}")
+    except Exception as e:
+        print(f"[IG scrape] Method 2 failed: {e}")
+
+    # ── Method 3: ?__a=1 API ─────────────────────────────────────────────
+    try:
+        api_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
+        r = session.get(api_url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            media = (
+                data.get("graphql", {}).get("shortcode_media")
+                or (data.get("items") or [{}])[0]
+                or {}
+            )
+            edges = (
+                media.get("edge_sidecar_to_children", {}).get("edges")
+                or media.get("carousel_media")
+                or []
+            )
+            urls = []
+            for edge in edges:
+                node = edge.get("node") or edge
+                resources = node.get("display_resources") or []
+                img_versions = node.get("image_versions2", {}).get("candidates") or []
+                if resources:
+                    urls.append(resources[-1].get("src", ""))
+                elif img_versions:
+                    urls.append(img_versions[0].get("url", ""))
+                elif node.get("display_url"):
+                    urls.append(node["display_url"])
+            urls = [u for u in urls if u]
+            if urls:
+                print(f"[IG scrape] ✅ Method 3 (?__a=1): {len(urls)} images")
+                return urls
+        else:
+            print(f"[IG scrape] Method 3 status={r.status_code}")
+    except Exception as e:
+        print(f"[IG scrape] Method 3 failed: {e}")
+
+    print("[IG scrape] ❌ All methods failed")
+    return []
 
 @app.route("/instagram/post", methods=["POST"])
 def instagram_post():
@@ -1391,117 +1579,87 @@ def instagram_post():
                 as_attachment=True,
                 download_name=f"{safe_title}.{ext}",
             )
-
         # ── CAROUSEL ───────────────────────────────────────────────────────
         if post_type == "carousel":
-            entries = info.get("entries") or []
-            if not entries:
-                return jsonify({"error": "Carousel has no entries"}), 404
-
             zip_buf = io.BytesIO()
-            errors: list[str] = []
+            entries = info.get("entries") or []
+            files = []
 
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for i, entry in enumerate(entries, start=1):
-                    entry_fmts = entry.get("formats") or []
+            if entries:
+                # Has entries — could be mixed video/image, try yt-dlp first
+                cp = _get_cookie_path("instagram")
+                dl_opts = {
+                    "quiet": True,
+                    "verbose": False,
+                    "noplaylist": False,
+                    "nocheckcertificate": True,
+                    "outtmpl": os.path.join(
+                        tmp, "%(playlist_index)s_%(title)s.%(ext)s"
+                    ),
+                    "http_headers": {"User-Agent": _IG_DL_HEADERS["User-Agent"]},
+                    "merge_output_format": "mp4",
+                    "postprocessors": [
+                        {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}
+                    ],
+                }
+                if cp:
+                    dl_opts["cookiefile"] = cp
+                try:
+                    with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                        ydl.download([url])
+                except Exception as e:
+                    print(f"[IG carousel] yt-dlp download error: {e}")
+                files = sorted(
+                    [
+                        os.path.join(tmp, f)
+                        for f in os.listdir(tmp)
+                        if os.path.isfile(os.path.join(tmp, f))
+                    ]
+                )
 
-                    # Check if this slide is actually a video
-                    has_vid = any(
-                        (f.get("vcodec") or "none") != "none"
-                        for f in entry_fmts
-                        if f.get("url")
-                    )
-
-                    if not has_vid:
-                        # ── IMAGE SLIDE — download thumbnail directly ──
-                        img_url = _ig_best_image_url(entry)
-                        if img_url:
-                            try:
-                                img_bytes, ext = _ig_download_image(img_url)
-                                zf.writestr(f"slide_{i:02d}.{ext}", img_bytes)
-                                print(f"[IG carousel] slide {i} image ✅")
-                            except Exception as e:
-                                errors.append(
-                                    f"slide_{i:02d} image error: {str(e)[:100]}"
-                                )
-                        else:
-                            errors.append(f"slide_{i:02d}: no image URL")
-                        continue
-
-                    # ── VIDEO SLIDE ────────────────────────────────────────
-                    slide_tmp = tempfile.mkdtemp(prefix=f"vf_ig_slide{i}_")
+            if not files:
+                # No entries or yt-dlp failed — use scraper (handles image-only carousels)
+                print("[IG carousel] using scraper for images")
+                image_urls = _ig_scrape_carousel_images(url)
+                for i, img_url in enumerate(image_urls, start=1):
                     try:
-                        slide_url = entry.get("webpage_url") or entry.get("url", "")
-                        if not slide_url:
-                            errors.append(f"slide_{i:02d}: no URL")
-                            continue
-
-                        opts = _ig_opts(
-                            {
-                                "format": "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-                                "outtmpl": os.path.join(slide_tmp, "%(title)s.%(ext)s"),
-                                "merge_output_format": "mp4",
-                                "postprocessors": [
-                                    {
-                                        "key": "FFmpegVideoConvertor",
-                                        "preferedformat": "mp4",
-                                    }
-                                ],
-                            }
-                        )
-                        with yt_dlp.YoutubeDL(opts) as ydl:
-                            ydl.extract_info(slide_url, download=True)
-
-                        mp4 = find_file(slide_tmp, "mp4")
-                        if mp4:
-                            with open(mp4, "rb") as fh:
-                                zf.writestr(f"slide_{i:02d}.mp4", fh.read())
-                            print(f"[IG carousel] slide {i} video ✅")
-                        else:
-                            errors.append(f"slide_{i:02d}: mp4 not found")
-
-                    except yt_dlp.utils.DownloadError as e:
-                        # "No video formats" = yt-dlp wrongly flagged an image slide as video
-                        # Fall back to image download
-                        if "no video formats" in str(e).lower():
-                            img_url = _ig_best_image_url(entry)
-                            if img_url:
-                                try:
-                                    img_bytes, ext = _ig_download_image(img_url)
-                                    zf.writestr(f"slide_{i:02d}.{ext}", img_bytes)
-                                    print(f"[IG carousel] slide {i} fallback image ✅")
-                                except Exception as fe:
-                                    errors.append(
-                                        f"slide_{i:02d} fallback error: {str(fe)[:80]}"
-                                    )
-                            else:
-                                errors.append(
-                                    f"slide_{i:02d}: no video formats and no image fallback"
-                                )
-                        else:
-                            errors.append(f"slide_{i:02d} video error: {str(e)[:100]}")
+                        img_bytes, ext = _ig_download_image(img_url)
+                        img_path = os.path.join(tmp, f"{i:02d}_slide.{ext}")
+                        with open(img_path, "wb") as fh:
+                            fh.write(img_bytes)
+                        print(f"[IG carousel] saved slide {i} ({ext})")
                     except Exception as e:
-                        errors.append(f"slide_{i:02d} unexpected: {str(e)[:100]}")
-                    finally:
-                        cleanup(slide_tmp)
+                        print(f"[IG carousel] failed slide {i}: {e}")
+                files = sorted(
+                    [
+                        os.path.join(tmp, f)
+                        for f in os.listdir(tmp)
+                        if os.path.isfile(os.path.join(tmp, f))
+                    ]
+                )
 
-            if errors:
-                print(f"[IG carousel] ⚠️ errors: {errors}")
+            print(f"[IG carousel] total files: {len(files)}")
 
-            zip_buf.seek(0)
-            if zip_buf.getbuffer().nbytes == 0:
+            if not files:
                 return (
-                    jsonify({"error": "All carousel slides failed", "details": errors}),
+                    jsonify({"error": "Carousel download failed — no files produced"}),
                     500,
                 )
 
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for i, fpath in enumerate(files, start=1):
+                    ext = os.path.splitext(fpath)[1].lstrip(".")
+                    with open(fpath, "rb") as fh:
+                        zf.writestr(f"slide_{i:02d}.{ext}", fh.read())
+                    print(f"[IG carousel] slide {i} ✅ ({ext})")
+
+            zip_buf.seek(0)
             return send_file(
                 zip_buf,
                 mimetype="application/zip",
                 as_attachment=True,
                 download_name=f"{safe_title}_carousel.zip",
             )
-
         return jsonify({"error": f"Unknown post type: {post_type}"}), 500
 
     except yt_dlp.utils.DownloadError as e:
@@ -1606,7 +1764,6 @@ def instagram_image():
 # ══════════════════════════════════════════════════════════════════════════════
 # DEBUG
 # ══════════════════════════════════════════════════════════════════════════════
-
 
 @app.route("/youtube/debug", methods=["POST"])
 def youtube_debug():
