@@ -1207,10 +1207,8 @@ def youtube_info():
             }
         )
     except yt_dlp.utils.DownloadError as e:
-        cleanup(tmp)
         return yt_err(str(e))
     except Exception as e:
-        cleanup(tmp)
         return jsonify({"error": str(e)[:300]}), 500
 
 
