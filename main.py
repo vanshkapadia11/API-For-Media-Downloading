@@ -502,6 +502,7 @@ def _base_opts(download: bool = False, proxy: str = "") -> dict:
     }
     if _node_exe:  # ← YE WAPAS DAL
         opts["js_runtimes"] = {"node": {"path": _node_exe}}  # ← YE WAPAS DAL
+        opts["remote_components"] = ["ejs:github"]  # npm nahi, sirf github
     p = proxy or _proxy_manager.current()
     if p:
         opts["proxy"] = p
