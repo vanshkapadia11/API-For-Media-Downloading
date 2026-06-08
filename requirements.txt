@@ -1,5 +1,5 @@
 flask==3.0.3
-yt-dlp
+yt-dlp>=2025.1.1
 gunicorn==22.0.0
 requests==2.32.3
 imageio-ffmpeg==0.5.1

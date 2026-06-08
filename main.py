@@ -391,15 +391,10 @@ _BOT_PATTERNS = [
     "bot check",
     "please sign in",
     "requires authentication",
-    "age-restricted",  # age gate = also needs cookies
-    "precondition check",  # often a disguised bot check
-    "members-only",  # sometimes confused with bot block
-    "this video is unavailable",  # generic but common after bot block
-    "video unavailable",
-    "nsig",  # JS challenge the n-sig extractor failed
-    "could not find js",  # yt-dlp can't find the player JS
-    "unable to extract",
-    "429",  # rate-limited → treat as soft bot-check
+    "age-restricted",
+    "precondition check",
+    "nsig",
+    "429",
     "too many requests",
 ]
 
@@ -505,9 +500,6 @@ def _base_opts(download: bool = False, proxy: str = "") -> dict:
         "socket_timeout": 180 if download else 15,  # ← Change 120 to 180
         "http_chunk_size": 10 * 1024 * 1024,  # 10 MB chunks for large files
     }
-    if _node_exe:
-        opts["js_runtimes"] = {"node": {"path": _node_exe}}
-        opts["remote_components"] = ["ejs:npm", "ejs:github"]
     p = proxy or _proxy_manager.current()
     if p:
         opts["proxy"] = p
