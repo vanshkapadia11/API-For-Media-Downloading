@@ -159,7 +159,7 @@ _proxy_manager = ProxyManager()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COOKIE MANAGEMENT
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════
 
 _cookie_path_cache: dict[str, str | None] = {}
 _cookie_freshness_cache: dict[str, tuple[bool, float]] = {}
@@ -531,7 +531,9 @@ def _base_opts(download: bool = False, proxy: str = "") -> dict:
 _last_success: dict = {"proxy_index": 0, "client": "android"}
 _last_success_lock = threading.Lock()
 
-_YT_CLIENT_CHAIN: list[tuple[str, list, bool, str]] = [
+_YT_CLIENT_CHAIN = [
+    ("android_testsuite", [], False, _UA_ANDROID),  # best cookieless
+    ("tv_embedded", [], False, _UA_TV),  # you have _UA_TV but never use it
     ("ios", [], False, _UA_IOS),
     ("android", [], False, _UA_ANDROID),
     ("mweb", [], False, _UA_IOS),
