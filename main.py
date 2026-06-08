@@ -182,13 +182,12 @@ def _check_po_generator() -> bool:
         return _po_token_generator_available
     found = bool(shutil.which("youtube-po-token-generator"))
     if found:
-        # Test if it actually works with a short timeout
         try:
             r = subprocess.run(
                 ["youtube-po-token-generator"],
                 capture_output=True,
                 text=True,
-                timeout=8,
+                timeout=30,  # ← was 8
             )
             json.loads(r.stdout)
             print(f"[po-token] ✅ found and working")
@@ -243,7 +242,7 @@ def _get_po_token(proxy: str = "") -> tuple[str, str]:
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     # t.join(timeout=12)  # wait max 12s, then give up
-    t.join(timeout=5)  # fail fast, don't block requests
+    t.join(timeout=25)  # fail fast, don't block requests
 
     if not result_holder:
         print("[po-token] ⏱ timed out repeatedly — disabling for this session")
@@ -670,8 +669,7 @@ def _extract_yt(url: str, extra: dict = {}, download: bool = False):
                     _proxy_manager.record_failure(current_proxy)
                     with _po_lock:
                         _po_token_cache.pop(current_proxy or "direct", None)
-                    _proxy_manager.rotate()
-                    current_proxy = _proxy_manager.current()
+                    # ← REMOVE the rotate lines, just continue to next client
                     continue
 
                 # Hard errors: propagate immediately
@@ -1872,6 +1870,18 @@ def youtube_debug():
             results[client] = {"ok": False, "error": str(e)[:200]}
     return jsonify(results)
 
+
+# Warm up PO token in background at startup
+def _warmup():
+    time.sleep(3)  # let gunicorn finish booting
+    print("[startup] warming up PO token...")
+    token, visitor = _get_po_token()
+    if token:
+        print(f"[startup] ✅ PO token ready")
+    else:
+        print(f"[startup] ❌ PO token not available — will retry on first request")
+
+threading.Thread(target=_warmup, daemon=True).start()
 
 # ══════════════════════════════════════════════════════════════════════════════
 
