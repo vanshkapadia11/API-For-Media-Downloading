@@ -500,6 +500,8 @@ def _base_opts(download: bool = False, proxy: str = "") -> dict:
         "socket_timeout": 180 if download else 15,  # ← Change 120 to 180
         "http_chunk_size": 10 * 1024 * 1024,  # 10 MB chunks for large files
     }
+    if _node_exe:  # ← YE WAPAS DAL
+        opts["js_runtimes"] = {"node": {"path": _node_exe}}  # ← YE WAPAS DAL
     p = proxy or _proxy_manager.current()
     if p:
         opts["proxy"] = p
